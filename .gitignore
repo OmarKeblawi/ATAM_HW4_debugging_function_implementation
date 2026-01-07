@@ -1,0 +1,14 @@
+# Ignore compiled binaries
+prf
+a.out
+*.out
+
+# Ignore object files
+*.o
+
+# Ignore the student ZIP file
+student_files.zip
+
+# Ignore temporary VS Code or OS files
+.vscode/
+.DS_Store

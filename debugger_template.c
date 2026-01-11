@@ -13,7 +13,9 @@ void debugger_loop(pid_t child_pid, long func_addr) {
     int recursion_depth = 0;        
     unsigned long first_ret_addr = 0;
     unsigned long first_ret_orig_data = 0;
+    unsigned long ret_trap;
     int ret_breakpoint_set = 0;
+    unsigned long rsp_at_call;
     struct user_regs_struct regs;
 
     // Synchronize with the stop after execv
@@ -40,9 +42,9 @@ void debugger_loop(pid_t child_pid, long func_addr) {
                 // Save return address for the outermost call only
                 first_ret_addr = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)regs.rsp, NULL);
                 first_ret_orig_data = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)first_ret_addr, NULL);
-                
+                rsp_at_call = regs.rsp;
                 // Set return breakpoint only for the outermost caller
-                unsigned long ret_trap = (first_ret_orig_data & ~0xFF) | 0xCC;
+                ret_trap = (first_ret_orig_data & ~0xFF) | 0xCC;
                 ptrace(PTRACE_POKETEXT, child_pid, (void*)first_ret_addr, (void*)ret_trap);
                 ret_breakpoint_set = 1;
             }
@@ -60,7 +62,10 @@ void debugger_loop(pid_t child_pid, long func_addr) {
         } 
         // CASE 2: Hit Return Breakpoint (The address saved in RSP)
         else if (ret_breakpoint_set && (regs.rip - 1 == first_ret_addr)) {
-            
+            ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
+
+
+            if(regs.rsp == rsp_at_call + 8) {
             // If we hit this, we are back at the original caller (e.g. main).
             // Recursion is definitely over.
             
@@ -74,8 +79,19 @@ void debugger_loop(pid_t child_pid, long func_addr) {
             ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
             ptrace(PTRACE_POKETEXT, child_pid, (void*)first_ret_addr, (void*)first_ret_orig_data);
             ret_breakpoint_set = 0;
-            
             ptrace(PTRACE_CONT, child_pid, NULL, NULL);
+            }
+            else {
+                // We are returning to an inner caller, just continue
+                regs.rip -= 1;
+                ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
+                ptrace(PTRACE_POKETEXT, child_pid, (void*)first_ret_addr, (void*)first_ret_orig_data);
+                ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
+                waitpid(child_pid, &wait_status, 0); // Synchronize
+                ptrace(PTRACE_POKETEXT, child_pid, (void*)first_ret_addr, (void*)ret_trap);
+                ptrace(PTRACE_CONT, child_pid, NULL, NULL);
+            }
+    
         }
         else {
             // Unexpected stop (maybe signal), continue

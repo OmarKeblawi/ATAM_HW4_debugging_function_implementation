@@ -1,104 +1,98 @@
-/* Code sample: using ptrace for simple tracing of a child process.
-**
-** Note: this was originally developed for a 32-bit x86 Linux system; some
-** changes may be required to port to x86-64.
-**
-** Eli Bendersky (http://eli.thegreenplace.net)
-** This code is in the public domain.
-*/
 #include <stdio.h>
-#include <stdarg.h>
 #include <stdlib.h>
-#include <signal.h>
-#include <syscall.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <sys/reg.h>
 #include <sys/user.h>
 #include <unistd.h>
 #include <errno.h>
 
+void debugger_loop(pid_t child_pid, long func_addr) {
+    int wait_status;
+    int call_sequence_counter = 0; 
+    int recursion_depth = 0;        
+    unsigned long first_ret_addr = 0;
+    unsigned long first_ret_orig_data = 0;
+    int ret_breakpoint_set = 0;
+    struct user_regs_struct regs;
 
-// This is just the template from the tutorial. You can edit it (and even its function signature) if needed. 
-// We do not call "run_target" in our tests at all. Use it freely as you wish, even delete it if you want. We don't care :)
-pid_t run_target(char** program) 
-{
-	pid_t pid;
-	
-	pid = fork();
-	
-    if (pid > 0) {
-		return pid;
-		
-    } else if (pid == 0) {
-		/* Allow tracing of this process */
-		if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
-			perror("ptrace");
-			exit(1);
-		}
-		/* Replace this process's image with the given program */
-		execv(program[0], program);
-	}
+    // Synchronize with the stop after execv
+    waitpid(child_pid, &wait_status, 0);
+
+    // Check for push rbp (0x55)
+    unsigned long orig_func_data = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)func_addr, NULL);
+    if ((orig_func_data & 0xFF) == 0x55) {
+        printf("PRF:: This function starts by pushing rbp\n");
+    }
+
+    // Set initial entry breakpoint
+    unsigned long entry_trap = (orig_func_data & ~0xFF) | 0xCC;
+    ptrace(PTRACE_POKETEXT, child_pid, (void*)func_addr, (void*)entry_trap);
+    ptrace(PTRACE_CONT, child_pid, NULL, NULL);
+
+    while (waitpid(child_pid, &wait_status, 0) && !WIFEXITED(wait_status)) {
+        ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
+
+        // CASE 1: Hit Entry Breakpoint (target_func start)
+        if (regs.rip - 1 == func_addr) {
+            if (recursion_depth == 0) {
+                call_sequence_counter++;
+                // Save return address for the outermost call only
+                first_ret_addr = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)regs.rsp, NULL);
+                first_ret_orig_data = ptrace(PTRACE_PEEKTEXT, child_pid, (void*)first_ret_addr, NULL);
+                
+                // Set return breakpoint only for the outermost caller
+                unsigned long ret_trap = (first_ret_orig_data & ~0xFF) | 0xCC;
+                ptrace(PTRACE_POKETEXT, child_pid, (void*)first_ret_addr, (void*)ret_trap);
+                ret_breakpoint_set = 1;
+            }
+            recursion_depth++;
+
+            // Step over the entry trap
+            regs.rip -= 1;
+            ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
+            ptrace(PTRACE_POKETEXT, child_pid, (void*)func_addr, (void*)orig_func_data);
+            ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
+            waitpid(child_pid, &wait_status, 0); // Synchronize
+            ptrace(PTRACE_POKETEXT, child_pid, (void*)func_addr, (void*)entry_trap);
+            
+            ptrace(PTRACE_CONT, child_pid, NULL, NULL);
+        } 
+        // CASE 2: Hit Return Breakpoint (The address saved in RSP)
+        else if (ret_breakpoint_set && (regs.rip - 1 == first_ret_addr)) {
+            
+            // If we hit this, we are back at the original caller (e.g. main).
+            // Recursion is definitely over.
+            
+            printf("PRF:: run #%d returned with %d\n", call_sequence_counter, (int)regs.rax);
+            
+            // Reset depth
+            recursion_depth = 0; 
+            
+            // Final cleanup of the return trap
+            regs.rip -= 1;
+            ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
+            ptrace(PTRACE_POKETEXT, child_pid, (void*)first_ret_addr, (void*)first_ret_orig_data);
+            ret_breakpoint_set = 0;
+            
+            ptrace(PTRACE_CONT, child_pid, NULL, NULL);
+        }
+        else {
+            // Unexpected stop (maybe signal), continue
+            ptrace(PTRACE_CONT, child_pid, NULL, NULL);
+        }
+    }
 }
 
-void debugger_loop(pid_t child_pid, long func_addr)
-{
-	int wait_status;
-	waitpid(child_pid, &wait_status, 0);
-	int counter = 0;
-	struct user_regs_struct regs;
-	//check the first instruction in the function before starting the child process:
-	unsigned long orig_data = ptrace(PTRACE_PEEKTEXT, child_pid,(void*)func_addr,NULL);
-	printf("PRF:: First instruction at function address 0x%lx: 0x%lx\n", func_addr, orig_data);
-	//check if the first instruction is "push rbp" (0x55)
-	if((orig_data & 0xFF) == 0x55){
-		printf("PRF:: This function starts by pushing rbp\n");
-	}
-
-	//Set a breakpoint at the beginning of the function
-	unsigned long brakpoint_data = (orig_data & 0xFFFFFFFFFFFFFF00) | 0xCC;
-	ptrace(PTRACE_POKETEXT, child_pid, (void*)func_addr, (void*)brakpoint_data);
-	//Continue the execution
-	ptrace(PTRACE_CONT, child_pid, NULL, NULL);
-	waitpid(child_pid, &wait_status, 0);
-
-	while(WIFSTOPPED(wait_status)) {
-		counter++;
-		ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
-		regs.rip -= 1; // Adjust RIP to point back to the breakpoint instruction
-		ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
-		ptrace(PTRACE_POKETEXT, child_pid, (void*)func_addr, (void*)orig_data);
-		ptrace(PTRACE_SINGLESTEP, child_pid, NULL, NULL);
-		wait(&wait_status);	
-		if(WIFSTOPPED(wait_status)){
-			//Reinsert the breakpoint
-			ptrace(PTRACE_POKETEXT, child_pid, (void*)func_addr, (void*)brakpoint_data);
-		}
-		//continue the execution
-		ptrace(PTRACE_CONT, child_pid, NULL, NULL);
-		waitpid(child_pid, &wait_status, 0);
-	}
-
-	if(WIFEXITED(wait_status)){
-		printf("PRF:: The function was executed %d times\n", counter);
-		return;
-	}
-	
-	
-
-}
-int main(int argc, char** argv)
-{
-    pid_t child_pid;
-
-	long fun_address = strtol(argv[1], NULL , 16);
-
-    child_pid = run_target(&argv[2]);
-	
-	// TODO: run specific "debugger"
-	debugger_loop(child_pid, fun_address);
-	
-
+int main(int argc, char** argv) {
+    if (argc < 3) return 1;
+    long fun_address = strtol(argv[1], NULL, 16);
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        execv(argv[2], &argv[2]);
+    } else {
+        debugger_loop(pid, fun_address);
+    }
     return 0;
 }
